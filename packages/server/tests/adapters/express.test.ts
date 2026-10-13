@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NextFunction, Request, Response } from 'express';
+import { createProvider } from '@chatcops/core';
 
 vi.mock('@chatcops/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@chatcops/core')>();
@@ -19,6 +20,8 @@ vi.mock('@chatcops/core', async (importOriginal) => {
 
 import { chatcopsAnalyticsHandler, chatcopsMiddleware } from '../../src/adapters/express.js';
 import type { ChatCopsServerConfig } from '../../src/config.js';
+
+const mockedCreateProvider = vi.mocked(createProvider);
 
 function createRequest(method: string, body?: unknown): Request {
   return {
@@ -84,6 +87,91 @@ describe('express analytics sharing', () => {
       clearInterval(result.value as ReturnType<typeof setInterval>);
     }
     vi.restoreAllMocks();
+  });
+
+  it('returns 204 and the configured CORS headers for OPTIONS', async () => {
+    const config: ChatCopsServerConfig = {
+      provider: { type: 'claude', apiKey: 'test-key' },
+      systemPrompt: 'Test',
+      cors: 'https://example.com',
+    };
+    const middleware = chatcopsMiddleware(config);
+    const { fake, res } = createResponse();
+
+    await middleware(createRequest('OPTIONS'), res, (() => undefined) as NextFunction);
+
+    expect(fake.statusCode).toBe(204);
+    expect(fake.headers).toMatchObject({
+      'Access-Control-Allow-Origin': 'https://example.com',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Max-Age': '86400',
+    });
+    expect(fake.ended).toBe(true);
+  });
+
+  it('returns 405 JSON for methods other than POST and OPTIONS', async () => {
+    const config: ChatCopsServerConfig = {
+      provider: { type: 'claude', apiKey: 'test-key' },
+      systemPrompt: 'Test',
+      cors: '*',
+    };
+    const middleware = chatcopsMiddleware(config);
+    const { fake, res } = createResponse();
+
+    await middleware(createRequest('GET'), res, (() => undefined) as NextFunction);
+
+    expect(fake.statusCode).toBe(405);
+    expect(fake.body).toEqual({ error: 'Method not allowed' });
+  });
+
+  it('streams chunks, a done event, and closes the response for POST', async () => {
+    const config: ChatCopsServerConfig = {
+      provider: { type: 'claude', apiKey: 'test-key' },
+      systemPrompt: 'Test',
+      cors: '*',
+    };
+    const middleware = chatcopsMiddleware(config);
+    const { fake, res } = createResponse();
+
+    await middleware(
+      createRequest('POST', { conversationId: 'streaming', message: 'Hello' }),
+      res,
+      (() => undefined) as NextFunction
+    );
+
+    expect(fake.headers).toMatchObject({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+    });
+    expect(fake.chunks).toEqual([
+      'data: {"content":"Hello"}\n\n',
+      'data: {"done":true}\n\n',
+      'data: [DONE]\n\n',
+    ]);
+    expect(fake.ended).toBe(true);
+  });
+
+  it('writes an internal error event and still ends when the handler throws', async () => {
+    mockedCreateProvider.mockRejectedValueOnce(new Error('provider unavailable'));
+    const config: ChatCopsServerConfig = {
+      provider: { type: 'claude', apiKey: 'test-key' },
+      systemPrompt: 'Test',
+      cors: '*',
+    };
+    const middleware = chatcopsMiddleware(config);
+    const { fake, res } = createResponse();
+
+    await middleware(
+      createRequest('POST', { conversationId: 'error', message: 'Hello' }),
+      res,
+      (() => undefined) as NextFunction
+    );
+
+    expect(fake.chunks).toEqual(['data: {"error":"internal_error"}\n\n']);
+    expect(fake.ended).toBe(true);
   });
 
   it('reports middleware traffic through chatcopsAnalyticsHandler', async () => {
